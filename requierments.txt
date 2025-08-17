@@ -1,0 +1,8 @@
+apache-airflow>=2.7
+google-api-python-client>=2.136.0
+google-auth>=2.30.0
+azure-storage-blob>=12.20.0
+requests>=2.32.3
+python-dateutil>=2.9.0
+dbt-core==1.10.6
+dbt-trino== 1.9.3
