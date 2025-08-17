@@ -1,3 +1,6 @@
 pipi
 kaki
 ./venv
+./.env
+.env
+*.env
