@@ -7,3 +7,4 @@ logs
 ./.env
 .env
 *.env
+airflow_env.json

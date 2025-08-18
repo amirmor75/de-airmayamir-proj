@@ -121,10 +121,8 @@ def _download_drive_file_as_bytes(drive, file_obj: Dict[str, Any]) -> (bytes, st
 # ---------- Utilities: Payments API ----------
 def _fetch_payments_payload(ds: str) -> Dict[str, Any]:
     url_template = os.environ["PAYMENTS_API_URL"]
-    api_key = os.environ["PAYMENTS_API_KEY"]
     url = url_template.format(ds=ds)
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
     }
     r = requests.get(url, headers=headers, timeout=60)
