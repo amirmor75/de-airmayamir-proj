@@ -1,4 +1,5 @@
 from airflow import DAG
+from airflow.models import Variable
 from datetime import datetime
 from cosmos.providers.dbt.core.dag import DbtDag
 from cosmos.config import (
@@ -21,9 +22,10 @@ profile_config = ProfileConfig(
         profile_args={
             "type": "trino",
             "threads": 1,
-            "host": "trino.de.bsmch.net",
-            "port": 8080,
-            "user": "hiveuser",
+            "host": Variable.get("TRINO_HOST"),
+            "port": Variable.get("TRINO_PORT"),
+            "user": Variable.get("TRINO_USER"),
+            "password": Variable.get("TRINO_PASSWORD"),
             "catalog": "iceberg",
             "schema": "dbt_schema",
             "http_scheme": "http"
