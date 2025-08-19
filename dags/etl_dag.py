@@ -26,39 +26,40 @@ with DAG(
     dim_payment_methods = TrinoOperator(
         task_id='dim_payment_methods',
         sql="""
-            INSERT INTO iceberg.analytics.dim_payment_methods (
-                method_name,
-                code
+            INSERT INTO iceberg.analytics.dim_payment_method (
+                payment_method_desc,
+                payment_method_code
             )
             SELECT
-                pm.transactionType AS method_name,
-                xxhash64(pm.payment_method) AS code
+                pm.transactionType AS payment_method_desc,
+                xxhash64(pm.transactionType) AS payment_method_code
             FROM (
                 SELECT DISTINCT transactionType
                 FROM hive.payme.payments
                 WHERE load_date >= DATE '{{ ds }}'
-                  AND load_date < DATE '{{ next_ds }}'
+                AND load_date < DATE '{{ next_ds }}'
             ) pm
             WHERE NOT EXISTS (
                 SELECT 1
-                FROM iceberg.analytics.dim_payment_methods existing
-                WHERE existing.method_name = pm.transactionType
+                FROM iceberg.analytics.dim_payment_method existing
+                WHERE existing.payment_method_desc = pm.transactionType
             );
         """,
-        trino_conn_id=trino_conn_id  # <-- Dynamically set from Variable
+        trino_conn_id=trino_conn_id
     )
+
 
     dim_currency = TrinoOperator(
         task_id='dim_currency',
         sql="""
             INSERT INTO iceberg.analytics.dim_currency (
-            currency_name,
-            code,
-            exchange_rate
+                currency_name,
+                currency_code,
+                exchange_rate
             )
             SELECT
                 new_currencies.currency AS currency_name,
-                xxhash64(new_currencies.currency) AS code,
+                xxhash64(new_currencies.currency) AS currency_code,
                 rates.rate AS exchange_rate
             FROM (
                 SELECT DISTINCT currency, paymentDate
@@ -98,7 +99,7 @@ with DAG(
         );
     """,
     trino_conn_id=trino_conn_id
-)
+    )
 
 
     dim_time = TrinoOperator(
@@ -149,208 +150,208 @@ with DAG(
         );
     """,
     trino_conn_id=trino_conn_id
-)
+    )
     
 
-dim_airline = TrinoOperator(
-    task_id='dim_airline',
-    sql="""
-        INSERT INTO iceberg.analytics.dim_airline (
-            airline_code
-        )
-        SELECT DISTINCT
-            airline_code
-        FROM (
+    dim_airline = TrinoOperator(
+        task_id='dim_airline',
+        sql="""
+            INSERT INTO iceberg.analytics.dim_airline (
+                airline_code
+            )
+            SELECT DISTINCT
+                airline_code
+            FROM (
+                SELECT
+                    regexp_extract(flight_number, '^[A-Z]+') AS airline_code
+                FROM hive.flight.flights
+                WHERE flight_number IS NOT NULL
+                AND load_date >= DATE '{{ ds }}'
+                AND load_date < DATE '{{ next_ds }}'
+            ) extracted
+            WHERE airline_code IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                FROM iceberg.analytics.dim_airline existing
+                WHERE existing.airline_code = extracted.airline_code
+            );
+        """,
+        trino_conn_id=trino_conn_id
+    )
+
+
+    stg_payments = TrinoOperator(
+        task_id='stg_payments',
+        sql="""
+            INSERT INTO iceberg.staging.stg_payments (
+                payment_id,
+                booking_id,
+                user_id,
+                payment_method_code,
+                currency_code,
+                base_currency,
+                paid_date_key,
+                paymentDate,
+                amount,
+                price_in_base_currency
+            )
             SELECT
-                regexp_extract(flight_number, '^[A-Z]+') AS airline_code
+                -- SK based on user_id + paid_date
+                xxhash64(p.user_id || DATE_FORMAT(DATE(p.paymentDate), '%Y-%m-%d')) AS payment_id,
+                b.booking_id,
+                p.user_id,
+                pm.code AS payment_method_code,
+                dc.code AS currency_code,
+                'ILS' AS base_currency,
+                CAST(DATE_FORMAT(p.paymentDate, '%Y%m%d') AS INT) AS paid_date_key,
+                p.paymentDate AS paid_at_timestamp,
+                p.amount,
+                p.amount * COALESCE(dc.exchange_rate, 1) AS price_in_base_currency
+            FROM hive.payme.payments p
+            LEFT JOIN hive.flight.bookings b
+                ON p.user_id = b.user_id
+            AND DATE(p.paid_at) = DATE(b.booking_date)
+            LEFT JOIN iceberg.analytics.payment_methods_summary pm
+                ON pm.method_name = p.payment_method
+            LEFT JOIN iceberg.analytics.dim_currency dc
+                ON dc.currency_name = p.currency
+            WHERE p.load_date >= DATE '{{ ds }}'
+            AND p.load_date < DATE '{{ next_ds }}';
+        """,
+        trino_conn_id=trino_conn_id
+    )    
+
+
+    stg_flights = TrinoOperator(
+        task_id='stg_flights',
+        sql="""
+            WITH bookings_filtered AS (
+            SELECT
+                flight_number,
+                DATE(departureDate) AS flight_date,
+                departureDate as scheduled_departure,
+                destination
+            FROM hive.flight.bookings
+            WHERE load_date >= DATE '{{ ds }}'
+            AND load_date < DATE '{{ next_ds }}'
+        ),
+
+        flights_filtered AS (
+            SELECT
+                flight_number,
+                departuredate,
+                seats_booked,
+                fuel_consumption,
+                fuel_price as fuel_price_per_unit,
+                crewmembers
             FROM hive.flight.flights
-            WHERE flight_number IS NOT NULL
-              AND load_date >= DATE '{{ ds }}'
-              AND load_date < DATE '{{ next_ds }}'
-        ) extracted
-        WHERE airline_code IS NOT NULL
-          AND NOT EXISTS (
-              SELECT 1
-              FROM iceberg.analytics.dim_airline existing
-              WHERE existing.airline_code = extracted.airline_code
-          );
-    """,
-    trino_conn_id=trino_conn_id
-)
+            WHERE load_date >= DATE '{{ ds }}'
+            AND load_date < DATE '{{ next_ds }}'
+        ),
 
+        -- Join bookings with flights on flight_number and date, 
+        -- pick max actual departure per flight + all other columns same as booking
+        joined_flights AS (
+            SELECT
+                b.flight_number,
+                b.flight_date,
+                b.scheduled_departure,
+                b.destination,
+                b.seats_booked,
+                b.fuel_consumption_units,
+                b.fuel_price_per_unit,
+                b.crew_members_count,
+                MAX(f.departure) AS actual_departure -- max actual departure per flight + date + booking attributes
+            FROM bookings_filtered b
+            LEFT JOIN flights_filtered f
+            ON b.flight_number = f.flight_number
+            AND DATE(f.departure) = b.flight_date
+            GROUP BY
+                b.flight_number,
+                b.flight_date,
+                b.scheduled_departure,
+                b.destination,
+                b.seats_booked,
+                b.fuel_consumption,
+                b.fuel_price_per_unit,
+                b.crewmembers
+        ),
 
-stg_payments = TrinoOperator(
-    task_id='stg_payments',
-    sql="""
-        INSERT INTO iceberg.staging.stg_payments (
-            payment_id,
-            booking_id,
-            user_id,
-            payment_method_code,
-            currency_code,
-            base_currency,
-            paid_date_key,
-            paymentDate,
-            amount,
-            price_in_base_currency
+        with_delay AS (
+            SELECT
+                flight_number,
+                flight_date,
+                scheduled_departure,
+                actual_departure,
+                destination,
+                seats_booked,
+                fuel_consumption_units,
+                fuel_price_per_unit,
+                crew_members_count,
+                CAST(MINUTES_BETWEEN(scheduled_departure, actual_departure) AS INT) AS delay_minutes,
+                xxhash64(flight_number || DATE_FORMAT(flight_date, '%Y-%m-%d')) AS flight_sk,
+                uuid() AS flight_id,
+                CAST(DATE_FORMAT(flight_date, '%Y%m%d') AS INT) AS date_key
+            FROM joined_flights
+        ),
+
+        with_destination_code AS (
+            SELECT
+                w.*,
+                dd.code AS destination_code
+            FROM with_delay w
+            LEFT JOIN iceberg.analytics.dim_destination dd
+            ON w.destination = dd.destination_name
+        ),
+
+        with_popularity_flag AS (
+            SELECT
+                w.*,
+                CASE WHEN freq.count_by_number > freq.avg_count THEN TRUE ELSE FALSE END AS popular_ind
+            FROM with_destination_code w
+            LEFT JOIN (
+                SELECT
+                    flight_number,
+                    COUNT(*) AS count_by_number,
+                    AVG(COUNT(*)) OVER () AS avg_count
+                FROM hive.flight.bookings
+                WHERE load_date >= DATE '{{ ds }}'
+                AND load_date < DATE '{{ next_ds }}'
+                GROUP BY flight_number
+            ) freq ON w.flight_number = freq.flight_number
         )
-        SELECT
-            -- SK based on user_id + paid_date
-            xxhash64(p.user_id || DATE_FORMAT(DATE(p.paymentDate), '%Y-%m-%d')) AS payment_id,
-            b.booking_id,
-            p.user_id,
-            pm.code AS payment_method_code,
-            dc.code AS currency_code,
-            'ILS' AS base_currency,
-            CAST(DATE_FORMAT(p.paymentDate, '%Y%m%d') AS INT) AS paid_date_key,
-            p.paymentDate AS paid_at_timestamp,
-            p.amount,
-            p.amount * COALESCE(dc.exchange_rate, 1) AS price_in_base_currency
-        FROM hive.payme.payments p
-        LEFT JOIN hive.flight.bookings b
-            ON p.user_id = b.user_id
-           AND DATE(p.paid_at) = DATE(b.booking_date)
-        LEFT JOIN iceberg.analytics.payment_methods_summary pm
-            ON pm.method_name = p.payment_method
-        LEFT JOIN iceberg.analytics.dim_currency dc
-            ON dc.currency_name = p.currency
-        WHERE p.load_date >= DATE '{{ ds }}'
-          AND p.load_date < DATE '{{ next_ds }}';
-    """,
-    trino_conn_id=trino_conn_id
-)    
 
-
-stg_flights = TrinoOperator(
-    task_id='stg_flights',
-    sql="""
-        WITH bookings_filtered AS (
-        SELECT
+        INSERT INTO iceberg.staging.stg_flights (
+            flight_sk,
+            flight_id,
             flight_number,
-            DATE(departureDate) AS flight_date,
-            departureDate as scheduled_departure,
-            destination
-        FROM hive.flight.bookings
-        WHERE load_date >= DATE '{{ ds }}'
-        AND load_date < DATE '{{ next_ds }}'
-    ),
-
-    flights_filtered AS (
-        SELECT
-            flight_number,
-            departuredate,
-            seats_booked,
-            fuel_consumption,
-            fuel_price as fuel_price_per_unit,
-            crewmembers
-        FROM hive.flight.flights
-        WHERE load_date >= DATE '{{ ds }}'
-        AND load_date < DATE '{{ next_ds }}'
-    ),
-
-    -- Join bookings with flights on flight_number and date, 
-    -- pick max actual departure per flight + all other columns same as booking
-    joined_flights AS (
-        SELECT
-            b.flight_number,
-            b.flight_date,
-            b.scheduled_departure,
-            b.destination,
-            b.seats_booked,
-            b.fuel_consumption_units,
-            b.fuel_price_per_unit,
-            b.crew_members_count,
-            MAX(f.departure) AS actual_departure -- max actual departure per flight + date + booking attributes
-        FROM bookings_filtered b
-        LEFT JOIN flights_filtered f
-        ON b.flight_number = f.flight_number
-        AND DATE(f.departure) = b.flight_date
-        GROUP BY
-            b.flight_number,
-            b.flight_date,
-            b.scheduled_departure,
-            b.destination,
-            b.seats_booked,
-            b.fuel_consumption,
-            b.fuel_price_per_unit,
-            b.crewmembers
-    ),
-
-    with_delay AS (
-        SELECT
-            flight_number,
-            flight_date,
-            scheduled_departure,
-            actual_departure,
-            destination,
+            date_key,
+            destination_code,
+            scheduled_departure_ts,
+            actual_departure_ts,
+            delay_minutes,
             seats_booked,
             fuel_consumption_units,
             fuel_price_per_unit,
             crew_members_count,
-            CAST(MINUTES_BETWEEN(scheduled_departure, actual_departure) AS INT) AS delay_minutes,
-            xxhash64(flight_number || DATE_FORMAT(flight_date, '%Y-%m-%d')) AS flight_sk,
-            uuid() AS flight_id,
-            CAST(DATE_FORMAT(flight_date, '%Y%m%d') AS INT) AS date_key
-        FROM joined_flights
-    ),
-
-    with_destination_code AS (
+            popular_ind
+        )
         SELECT
-            w.*,
-            dd.code AS destination_code
-        FROM with_delay w
-        LEFT JOIN iceberg.analytics.dim_destination dd
-        ON w.destination = dd.destination_name
-    ),
-
-    with_popularity_flag AS (
-        SELECT
-            w.*,
-            CASE WHEN freq.count_by_number > freq.avg_count THEN TRUE ELSE FALSE END AS popular_ind
-        FROM with_destination_code w
-        LEFT JOIN (
-            SELECT
-                flight_number,
-                COUNT(*) AS count_by_number,
-                AVG(COUNT(*)) OVER () AS avg_count
-            FROM hive.flight.bookings
-            WHERE load_date >= DATE '{{ ds }}'
-            AND load_date < DATE '{{ next_ds }}'
-            GROUP BY flight_number
-        ) freq ON w.flight_number = freq.flight_number
+            flight_sk,
+            flight_id,
+            flight_number,
+            date_key,
+            destination_code,
+            scheduled_departure,
+            actual_departure,
+            delay_minutes,
+            seats_booked,
+            fuel_consumption_units,
+            fuel_price_per_unit,
+            crew_members_count,
+            popular_ind
+        FROM with_popularity_flag
+        ;
+        """,
+        trino_conn_id=trino_conn_id
     )
-
-    INSERT INTO iceberg.staging.stg_flights (
-        flight_sk,
-        flight_id,
-        flight_number,
-        date_key,
-        destination_code,
-        scheduled_departure_ts,
-        actual_departure_ts,
-        delay_minutes,
-        seats_booked,
-        fuel_consumption_units,
-        fuel_price_per_unit,
-        crew_members_count,
-        popular_ind
-    )
-    SELECT
-        flight_sk,
-        flight_id,
-        flight_number,
-        date_key,
-        destination_code,
-        scheduled_departure,
-        actual_departure,
-        delay_minutes,
-        seats_booked,
-        fuel_consumption_units,
-        fuel_price_per_unit,
-        crew_members_count,
-        popular_ind
-    FROM with_popularity_flag
-    ;
-    """,
-    trino_conn_id=trino_conn_id
-)
