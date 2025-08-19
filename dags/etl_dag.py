@@ -1,60 +1,49 @@
 from airflow import DAG
+from airflow.providers.trino.operators.trino import TrinoOperator
+from airflow.utils.dates import days_ago
 from airflow.models import Variable
-from datetime import datetime
-from cosmos.providers.dbt.core.dag import DbtDag
-from cosmos.config import (
-    DbtProjectConfig,
-    ExecutionConfig,
-    ProfileConfig,
-    ProfileMapping,
-)
-from cosmos.constants import LoadMode
-from pathlib import Path
+from datetime import timedelta
 
-# Path to your dbt project
-DBT_PROJECT_PATH = Path("../dbt/AirMayAmir")
+default_args = {
+    'owner': 'airflow',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
 
-# Profile config for Trino + Iceberg
-profile_config = ProfileConfig(
-    profile_name="default",
-    target_name="dev",
-    profile_mapping=ProfileMapping(
-        profile_args={
-            "type": "trino",
-            "threads": 1,
-            "host": Variable.get("TRINO_HOST"),
-            "port": Variable.get("TRINO_PORT"),
-            "user": Variable.get("TRINO_USER"),
-            "password": Variable.get("TRINO_PASSWORD"),
-            "catalog": "iceberg",
-            "schema": "dbt_schema",
-            "http_scheme": "http"
-        }
-    )
-)
+# Fetch the Trino connection ID from Airflow Variables
+trino_conn_id = Variable.get("TRINO_CONN_ID")  # <-- Defined in Airflow UI
 
-# DAG setup
 with DAG(
-    dag_id="etl_dag",
-    start_date=datetime(2023, 1, 1),
-    schedule_interval="@daily",
+    dag_id='airmayamir',
+    default_args=default_args,
+    description='airmayamir',
+    schedule_interval='@daily',
+    start_date=days_ago(1),
     catchup=False,
-    tags=["dbt", "cosmos", "per-model"],
+    tags=['trino', 'iceberg', 'hive', 'dedup', 'hash']
 ) as dag:
 
-    dbt_dag = DbtDag(
-        project_config=DbtProjectConfig(
-            dbt_project_path=DBT_PROJECT_PATH,
-            project_name="AirMayAmir"
-        ),
-        profile_config=profile_config,
-        execution_config=ExecutionConfig(
-            dbt_executable_path="dbt"
-        ),
-        load_mode=LoadMode.DBT_LS,  # Uses `dbt ls` to discover models
-        operator_args={
-            "install_deps": False  # skip deps install in prod
-        },
+    insert_new_payment_methods = TrinoOperator(
+        task_id='insert_new_payment_methods',
+        sql="""
+            INSERT INTO iceberg.analytics.payment_methods_summary (
+                method_name,
+                code
+            )
+            SELECT
+                pm.payment_method AS method_name,
+                xxhash64(pm.payment_method) AS code
+            FROM (
+                SELECT DISTINCT payment_method
+                FROM hive.payme.payments
+                WHERE payment_date >= DATE '{{ ds }}'
+                  AND payment_date < DATE '{{ next_ds }}'
+            ) pm
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM iceberg.analytics.payment_methods_summary existing
+                WHERE existing.method_name = pm.payment_method
+            );
+        """,
+        trino_conn_id=trino_conn_id  # <-- Dynamically set from Variable
     )
-
-    dbt_dag  # registers the per-model tasks
