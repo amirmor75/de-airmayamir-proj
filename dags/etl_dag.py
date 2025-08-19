@@ -36,8 +36,8 @@ with DAG(
             FROM (
                 SELECT DISTINCT payment_method
                 FROM hive.payme.payments
-                WHERE payment_date >= DATE '{{ ds }}'
-                  AND payment_date < DATE '{{ next_ds }}'
+                WHERE load_date >= DATE '{{ ds }}'
+                  AND load_date < DATE '{{ next_ds }}'
             ) pm
             WHERE NOT EXISTS (
                 SELECT 1
