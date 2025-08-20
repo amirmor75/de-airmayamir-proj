@@ -530,3 +530,110 @@ with DAG(
         """,
         trino_conn_id=trino_conn_id
     )
+
+
+    gold_fct_flights = TrinoOperator(
+        task_id='gold_fct_flights',
+        sql="""
+            INSERT INTO iceberg.gold.gold_fct_flights (
+                flight_id,
+                date_key,
+                destination_code,
+                airline_code,
+                popular_flight_count,
+                non_popular_flight_count,
+                revenue_base_sum,
+                delay_minutes_sum,
+                seats_booked_sum,
+                fuel_consumption_units_sum,
+                fuel_price_sum,
+                crew_members_count_sum
+            )
+            SELECT
+                sf.flight_id,
+                sf.date_key,
+                sf.destination_code,
+                regexp_extract(sf.flight_number, '^[A-Z]+') AS airline_code,
+                SUM(CASE WHEN sf.popular_ind THEN 1 ELSE 0 END) AS popular_flight_count,
+                SUM(CASE WHEN NOT sf.popular_ind THEN 1 ELSE 0 END) AS non_popular_flight_count,
+                SUM(sb.price_in_base_currency) - SUM(sf.fuel_consumption * sf.fuel_price_per_unit) AS revenue_base_sum,
+                SUM(sf.delay_minutes) AS delay_minutes_sum,
+                SUM(sf.seats_booked) AS seats_booked_sum,
+                SUM(sf.fuel_consumption) AS fuel_consumption_units_sum,
+                SUM(sf.fuel_price_per_unit) AS fuel_price_sum,
+                SUM(sf.crew_members_count) AS crew_members_count_sum
+            FROM iceberg.staging.stg_flights sf
+            LEFT JOIN iceberg.staging.stg_bookings sb
+            ON sf.flight_id = sb.booking_id
+            WHERE sf.date_key = CAST(DATE_FORMAT(DATE '{{ ds }}', '%Y%m%d') AS INT)
+            GROUP BY sf.flight_id, sf.date_key, sf.destination_code, airline_code;
+        """,
+        trino_conn_id=trino_conn_id
+    )
+
+
+    gold_fct_checkins = TrinoOperator(
+        task_id='gold_fct_checkins',
+        sql="""
+            INSERT INTO iceberg.gold.gold_fct_checkins (
+                flight_id,
+                date_key,
+                destination_code,
+                airline_code,
+                checkins_count,
+                checkin_delay_minutes_sum,
+                delayed_checkins_count,
+                missed_checkin_count
+            )
+            SELECT
+                sc.flight_id,
+                sc.date_key,
+                sf.destination_code,
+                regexp_extract(sf.flight_number, '^[A-Z]+') AS airline_code,
+                COUNT(*) AS checkins_count,
+                SUM(sc.checkin_delay_minutes) AS checkin_delay_minutes_sum,
+                SUM(CASE WHEN sc.delayed_checkin_ind THEN 1 ELSE 0 END) AS delayed_checkins_count,
+                SUM(CASE WHEN sc.checkin_ts > sf.scheduled_departure_ts THEN 1 ELSE 0 END) AS missed_checkin_count
+            FROM iceberg.staging.stg_checkins sc
+            LEFT JOIN iceberg.staging.stg_flights sf
+            ON sc.flight_id = sf.flight_id
+            WHERE sc.date_key = CAST(DATE_FORMAT(DATE '{{ ds }}', '%Y%m%d') AS INT)
+            GROUP BY sc.flight_id, sc.date_key, sf.destination_code, airline_code;
+        """,
+        trino_conn_id=trino_conn_id
+    )
+
+
+    gold_fct_payments = TrinoOperator(
+        task_id='gold_fct_payments',
+        sql="""
+            INSERT INTO iceberg.gold.gold_fct_payments (
+                date_key,
+                destination_code,
+                currency_code,
+                payment_method_code,
+                payment_count,
+                booking_count_distinct,
+                amount_base_sum,
+                avg_exchange_rate
+            )
+            SELECT
+                sp.paid_date_key AS date_key,
+                sb.destination_code,
+                sp.currency_code,
+                sp.payment_method_code,
+                COUNT(*) AS payment_count,
+                COUNT(DISTINCT sp.booking_id) AS booking_count_distinct,
+                SUM(sp.price_in_base_currency) AS amount_base_sum,
+                AVG(CASE 
+                    WHEN sp.amount > 0 THEN sp.price_in_base_currency / sp.amount 
+                    ELSE NULL 
+                END) AS avg_exchange_rate
+            FROM iceberg.staging.stg_payments sp
+            LEFT JOIN iceberg.staging.stg_bookings sb
+            ON sp.booking_id = sb.booking_id
+            WHERE sp.paid_date_key = CAST(DATE_FORMAT(DATE '{{ ds }}', '%Y%m%d') AS INT)
+            GROUP BY sp.paid_date_key, sb.destination_code, sp.currency_code, sp.payment_method_code;
+        """,
+        trino_conn_id=trino_conn_id
+    )
