@@ -637,3 +637,19 @@ with DAG(
         """,
         trino_conn_id=trino_conn_id
     )
+
+
+    # Dimension tasks
+    dim_payment_methods >> stg_payments
+    dim_currency >> [stg_payments, stg_bookings]
+    dim_destination >> [stg_flights, stg_bookings]
+    dim_passenger >> stg_checkins
+    dim_airline >> stg_flights
+
+    # Flights must be processed before check-ins
+    stg_flights >> stg_checkins
+
+    # Fact table dependencies
+    [stg_flights, stg_bookings] >> gold_fct_flights
+    [stg_checkins, stg_flights] >> gold_fct_checkins
+    [stg_payments, stg_bookings] >> gold_fct_payments
